@@ -49,13 +49,10 @@ from ...utils import (
     replace_return_docstrings,
 )
 from .configuration_llama import LlamaConfig
+
 import numa
 import threading
-import psutil
 import time
-import pdb
-import copy
-import sys
 
 
 logger = logging.get_logger(__name__)
@@ -363,24 +360,51 @@ class LlamaAttention(nn.Module):
             cos, sin = position_embeddings
         query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
 
-        if past_key_value is not None:
-            # sin and cos are specific to RoPE models; cache_position needed for the static cache
-            cache_kwargs = {"sin": sin, "cos": cos, "cache_position": cache_position}
-            key_states, value_states = past_key_value.update(key_states, value_states, self.layer_idx, cache_kwargs)
+        def run_attn(node_id):
+            numa.set_membind([node_id])
+            numa.set_affinity(0, list(range(0, 40)))
 
-        key_states = repeat_kv(key_states, self.num_key_value_groups)
-        value_states = repeat_kv(value_states, self.num_key_value_groups)
-        attn_weights = torch.matmul(query_states, key_states.transpose(2, 3)) / math.sqrt(self.head_dim)
+            nonlocal attn_output, key_states, value_states, query_states
+            if past_key_value is not None:
+                # sin and cos are specific to RoPE models; cache_position needed for the static cache
+                cache_kwargs = {"sin": sin, "cos": cos, "cache_position": cache_position}
+                key_states_local, value_states_local = past_key_value.update(key_states, value_states, self.layer_idx, cache_kwargs)
 
-        if attention_mask is not None:  # no matter the length, we just slice it
-            causal_mask = attention_mask[:, :, :, : key_states.shape[-2]]
-            attn_weights = attn_weights + causal_mask
+            key_states_local = repeat_kv(key_states_local, self.num_key_value_groups)
+            value_states_local = repeat_kv(value_states_local, self.num_key_value_groups)
+            attn_weights = torch.matmul(query_states, key_states_local.transpose(2, 3)) / math.sqrt(self.head_dim)
 
-        # upcast attention to fp32
-        attn_weights = nn.functional.softmax(attn_weights, dim=-1, dtype=torch.float32).to(query_states.dtype)
-        attn_weights = nn.functional.dropout(attn_weights, p=self.attention_dropout, training=self.training)
-        attn_output = torch.matmul(attn_weights, value_states)
+            if attention_mask is not None:  # no matter the length, we just slice it
+                causal_mask = attention_mask[:, :, :, : key_states.shape[-2]]
+                attn_weights = attn_weights + causal_mask
 
+            # upcast attention to fp32
+            attn_weights = nn.functional.softmax(attn_weights, dim=-1, dtype=torch.float32).to(query_states.dtype)
+            attn_weights = nn.functional.dropout(attn_weights, p=self.attention_dropout, training=self.training)
+            attn_output = torch.matmul(attn_weights, value_states_local)
+        # if past_key_value is not None:
+        #     # sin and cos are specific to RoPE models; cache_position needed for the static cache
+        #     cache_kwargs = {"sin": sin, "cos": cos, "cache_position": cache_position}
+        #     key_states, value_states = past_key_value.update(key_states, value_states, self.layer_idx, cache_kwargs)
+
+        # key_states = repeat_kv(key_states, self.num_key_value_groups)
+        # value_states = repeat_kv(value_states, self.num_key_value_groups)
+        # attn_weights = torch.matmul(query_states, key_states.transpose(2, 3)) / math.sqrt(self.head_dim)
+
+        # if attention_mask is not None:  # no matter the length, we just slice it
+        #     causal_mask = attention_mask[:, :, :, : key_states.shape[-2]]
+        #     attn_weights = attn_weights + causal_mask
+
+        # # upcast attention to fp32
+        # attn_weights = nn.functional.softmax(attn_weights, dim=-1, dtype=torch.float32).to(query_states.dtype)
+        # attn_weights = nn.functional.dropout(attn_weights, p=self.attention_dropout, training=self.training)
+        # attn_output = torch.matmul(attn_weights, value_states)
+        attn_output = torch.zeros((bsz, q_len, self.hidden_size), device=hidden_states.device, dtype=hidden_states.dtype)
+        attn_thread = threading.Thread(target=run_attn, args=(0,))
+        attn_thread.start()
+        attn_thread.join()
+
+        numa.set_affinity(0, list(range(0, 40)))
         if attn_output.size() != (bsz, self.num_heads, q_len, self.head_dim):
             raise ValueError(
                 f"`attn_output` should be of size {(bsz, self.num_heads, q_len, self.head_dim)}, but is"
@@ -581,108 +605,95 @@ class LlamaSdpaAttention(LlamaAttention):
             cos, sin = self.rotary_emb(value_states, position_ids)
         else:
             cos, sin = position_embeddings
-       
         query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
 
-        # if past_key_value is not None:
-        #     cache_kwargs_test = {"sin": sin, "cos": cos, "cache_position": cache_position}
-        #     past_key_value_test = copy.deepcopy(past_key_value)
-        #     key_states_test, value_states_test = past_key_value_test.update(key_states, value_states, self.layer_idx, cache_kwargs_test)
-       
-        def update_kvcache(node_id):
-            numa.set_membind([node_id])
-            nonlocal key_states, value_states
-            if past_key_value is not None:
-                # sin and cos are specific to RoPE models; cache_position needed for the static cache
-                cache_kwargs = {"sin": sin, "cos": cos, "cache_position": cache_position}
-                key_states_entire, value_states_entire = past_key_value.update(key_states, value_states, self.layer_idx, cache_kwargs)
-        # if past_key_value is not None:
-        #     # sin and cos are specific to RoPE models; cache_position needed for the static cache
-        #     cache_kwargs = {"sin": sin, "cos": cos, "cache_position": cache_position}
-        #     key_states, value_states = past_key_value.update(key_states, value_states, self.layer_idx, cache_kwargs)
-
-        # kvcache_update_thread = threading.Thread(target=update_kvcache, args=(3,))
-        # kvcache_update_thread.start()
-        # kvcache_update_thread.join()
-        # numa.set_membind([0])
-        # key_states_test = repeat_kv(key_states, self.num_key_value_groups)
-        # value_states_test = repeat_kv(value_states, self.num_key_value_groups)
-        # print(f"test result:  {torch.equal(key_states, key_states_test)}, {torch.equal(value_states,value_states_test)}")
         causal_mask = attention_mask
         if attention_mask is not None:
             causal_mask = causal_mask[:, :, :, : key_states.shape[-2]]
+
+        # SDPA with memory-efficient backend is currently (torch==2.1.2) bugged with non-contiguous inputs with custom attn_mask,
+        # Reference: https://github.com/pytorch/pytorch/issues/112577.
+        # if query_states.device.type == "cuda" and causal_mask is not None:
+        #     query_states = query_states.contiguous()
+        #     key_states = key_states.contiguous()
+        #     value_states = value_states.contiguous()
+
+        # We dispatch to SDPA's Flash Attention or Efficient kernels via this `is_causal` if statement instead of an inline conditional assignment
+        # in SDPA to support both torch.compile's dynamic shapes and full graph options. An inline conditional prevents dynamic shapes from compiling.
         is_causal = True if causal_mask is None and q_len > 1 else False
-        # attn_output_test = torch.nn.functional.scaled_dot_product_attention(
-        #         query_states,
-        #         key_states_test,
-        #         value_states_test,
-        #         attn_mask=causal_mask,
-        #         dropout_p=self.attention_dropout if self.training else 0.0,
-        #         is_causal=is_causal,
-        # ).transpose(1, 2).contiguous().view(bsz, q_len, -1)
-        # attn_output_test = self.o_proj(attn_output_test)
-        def run_self_attn(is_causal, causal_mask):
-            numa.set_affinity(0, list(range(40,80)))
-            numa.set_membind([3])
-            nonlocal attn_output
+        
+        def run_attn(node_id, is_causal, causal_mask):
+            attn_start = time.perf_counter_ns()
+            numa.set_membind([node_id])
+            cores_0 = list(range(0, 40))
+            cores_1 = list(range(40, 80))
+            numa.set_affinity(0, cores_0)
+            nonlocal key_states, value_states, attn_output
+            torch.set_num_threads(40)
 
+            kv_update_start = time.perf_counter_ns()
             if past_key_value is not None:
-                # sin and cos are specific to RoPE models; cache_position needed for the static cache
                 cache_kwargs = {"sin": sin, "cos": cos, "cache_position": cache_position}
-                kv_update_start = time.perf_counter_ns()
-                key_states_entire, value_states_entire = past_key_value.update(key_states, value_states, self.layer_idx, cache_kwargs)
-                kv_update_end = time.perf_counter_ns()
-                print("kv cache update:", kv_update_end - kv_update_start, "ns")
-                print(f"len k cache: {len(past_key_value.key_cache)} layer index: {self.layer_idx}")
-            
-            key_states_entire = repeat_kv(key_states_entire, self.num_key_value_groups)
-            value_states_entire = repeat_kv(value_states_entire, self.num_key_value_groups)
-            query_states_local = query_states
+                key_states_local, value_states_local = past_key_value.update(key_states, value_states, self.layer_idx, cache_kwargs)
+            kv_update_end = time.perf_counter_ns()
+            print(f"kv cache update: {kv_update_end - kv_update_start}ns")
 
-            # SDPA with memory-efficient backend is currently (torch==2.1.2) bugged with non-contiguous inputs with custom attn_mask,
-            # Reference: https://github.com/pytorch/pytorch/issues/112577.
+            repeat_start = time.perf_counter_ns()
+            key_states_local = repeat_kv(key_states_local, self.num_key_value_groups)
+            value_states_local = repeat_kv(value_states_local, self.num_key_value_groups) 
+            repeat_end = time.perf_counter_ns()
+            print(f"repeat: {repeat_end - repeat_start}ns")
 
-            # if query_states_local.device.type == "cuda" and causal_mask is not None:
-            #     query_states_local = query_states_local.contiguous()
-            #     key_states_local = key_states_local.contiguous()
-            #     value_states_local = value_states_local.contiguous()
-
-            # We dispatch to SDPA's Flash Attention or Efficient kernels via this `is_causal` if statement instead of an inline conditional assignment
-            # in SDPA to support both torch.compile's dynamic shapes and full graph options. An inline conditional prevents dynamic shapes from compiling.
-
+            sdpa_start = time.perf_counter_ns()
             attn_output_local = torch.nn.functional.scaled_dot_product_attention(
-                query_states_local,
-                key_states_entire,
-                value_states_entire,
+                query_states,
+                key_states_local,
+                value_states_local,
                 attn_mask=causal_mask,
                 dropout_p=self.attention_dropout if self.training else 0.0,
                 is_causal=is_causal,
             )
-
-            attn_output_local = attn_output_local.transpose(1, 2).contiguous()
-            attn_output_local = attn_output_local.view(bsz, q_len, -1)
-
+            sdpa_end = time.perf_counter_ns()
+            print(f"sdpa: {sdpa_end - sdpa_start}ns")
             attn_output = attn_output_local
-            
-            
+            attn_end = time.perf_counter_ns()
+            print(f"attn func: {attn_end - attn_start}ns")
 
-        cores_0 = list(range(0,40))
-        cores_1 = list(range(40,80))
-        numa.set_affinity(0, cores_1)
-        #numa.set_membind([3])
         attn_output = torch.zeros((bsz, q_len, self.hidden_size), device=hidden_states.device, dtype=hidden_states.dtype)
-        thread1 = threading.Thread(target=run_self_attn,args=(is_causal,causal_mask))
-        attention_start = time.perf_counter_ns()
-        thread1.start()
-        #pid = psutil.Process().pid
-        #print(f"cpu affinity: {psutil.Process(pid).cpu_affinity()}")
-        thread1.join()
-        attention_end = time.perf_counter_ns()
-        print(f"attention duration: {attention_end - attention_start}ns")
-        numa.set_affinity(0, cores_0)
+        if len(past_key_value.key_cache) == self.layer_idx:
+            #prefill
+            if past_key_value is not None:
+                # sin and cos are specific to RoPE models; cache_position needed for the static cache
+                cache_kwargs = {"sin": sin, "cos": cos, "cache_position": cache_position}
+                key_states, value_states = past_key_value.update(key_states, value_states, self.layer_idx, cache_kwargs)
+
+            key_states = repeat_kv(key_states, self.num_key_value_groups)
+            value_states = repeat_kv(value_states, self.num_key_value_groups) 
+
+            attn_output = torch.nn.functional.scaled_dot_product_attention(
+                query_states,
+                key_states,
+                value_states,
+                attn_mask=causal_mask,
+                dropout_p=self.attention_dropout if self.training else 0.0,
+                is_causal=is_causal,
+            )
+        else:
+            #decode
+            attn_thread = threading.Thread(target=run_attn, args= (0, is_causal, causal_mask))
+            thread_start = time.perf_counter_ns()
+            attn_thread.start()
+            attn_thread.join()
+            thread_end = time.perf_counter_ns()
+            print(f"attn thread: {thread_end - thread_start}ns")
+
+        cores_0 = list(range(0, 40))
         numa.set_membind([0])
+        numa.set_affinity(0, cores_0)
+        attn_output = attn_output.transpose(1, 2).contiguous()
+        attn_output = attn_output.view(bsz, q_len, -1)
+
         attn_output = self.o_proj(attn_output)
-        # print(f"test result: {torch.equal(attn_output, attn_output_test)}")
 
         return attn_output, None, past_key_value
 
@@ -739,16 +750,12 @@ class LlamaDecoderLayer(nn.Module):
                 Arbitrary kwargs to be ignored, used for FSDP and other methods that injects code
                 into the model
         """
-        decoder_start = time.perf_counter_ns()
+        cores_0 = list(range(0, 40))
+        numa.set_affinity(0, cores_0)
+        numa.set_membind([0])
         residual = hidden_states
-        def layer_norm(node_id):
-            numa.set_membind([node_id])
-            nonlocal hidden_states
-            hidden_states = self.input_layernorm(hidden_states)
+
         hidden_states = self.input_layernorm(hidden_states)
-        # layernorm_thread = threading.Thread(target=layer_norm, args=(0,))
-        # layernorm_thread.start()
-        # layernorm_thread.join()
 
         # Self Attention
         hidden_states, self_attn_weights, present_key_value = self.self_attn(
@@ -762,34 +769,28 @@ class LlamaDecoderLayer(nn.Module):
             position_embeddings=position_embeddings,
             **kwargs,
         )
+
+        numa.set_membind([0])
+        numa.set_affinity(0, cores_0)
         hidden_states = residual + hidden_states
 
         # Fully Connected
         residual = hidden_states
-        def ffn(node_id):
-            numa.set_membind([node_id])
-            nonlocal hidden_states
-            hidden_states = self.post_attention_layernorm(hidden_states)
-            hidden_states = self.mlp(hidden_states)
-            hidden_states = residual + hidden_states
-            
         hidden_states = self.post_attention_layernorm(hidden_states)
         hidden_states = self.mlp(hidden_states)
         hidden_states = residual + hidden_states
-        # ffn_thread = threading.Thread(target=ffn, args=(0,))
-        # ffn_thread.start()
-        # ffn_thread.join()
 
         outputs = (hidden_states,)
+
+        numa.set_membind([3])
+        numa.set_affinity(0, cores_0)
+
         if output_attentions:
             outputs += (self_attn_weights,)
 
         if use_cache:
             outputs += (present_key_value,)
-            print(present_key_value.key_cache[0].shape)
 
-        decoder_end = time.perf_counter_ns()
-        print(f"decoder: {decoder_end - decoder_start}ns")
         return outputs
 
 
@@ -982,35 +983,18 @@ class LlamaModel(LlamaPreTrainedModel):
 
         # kept for BC (non `Cache` `past_key_values` inputs)
         return_legacy_cache = False
-        
-        def init_kvcache(node_id):
-            numa.set_membind([node_id])
-            nonlocal return_legacy_cache, past_key_values
-            if use_cache and not isinstance(past_key_values, Cache):
-                return_legacy_cache = True
-                if past_key_values is None:
-                    past_key_values = DynamicCache()
-                else:
-                    past_key_values = DynamicCache.from_legacy_cache(past_key_values)
-                    logger.warning_once(
-                        "We detected that you are passing `past_key_values` as a tuple of tuples. This is deprecated and "
-                        "will be removed in v4.47. Please convert your cache or use an appropriate `Cache` class "
-                        "(https://huggingface.co/docs/transformers/kv_cache#legacy-cache-format)"
-                    )
-        init_kvcache_thread = threading.Thread(target=init_kvcache,args=(3,))
-        init_kvcache_thread.start()
-        init_kvcache_thread.join()
-        # if use_cache and not isinstance(past_key_values, Cache):
-        #     return_legacy_cache = True
-        #     if past_key_values is None:
-        #         past_key_values = DynamicCache()
-        #     else:
-        #         past_key_values = DynamicCache.from_legacy_cache(past_key_values)
-        #         logger.warning_once(
-        #             "We detected that you are passing `past_key_values` as a tuple of tuples. This is deprecated and "
-        #             "will be removed in v4.47. Please convert your cache or use an appropriate `Cache` class "
-        #             "(https://huggingface.co/docs/transformers/kv_cache#legacy-cache-format)"
-        #         )
+        if use_cache and not isinstance(past_key_values, Cache):
+            return_legacy_cache = True
+            if past_key_values is None:
+                past_key_values = DynamicCache()
+            else:
+                past_key_values = DynamicCache.from_legacy_cache(past_key_values)
+                logger.warning_once(
+                    "We detected that you are passing `past_key_values` as a tuple of tuples. This is deprecated and "
+                    "will be removed in v4.47. Please convert your cache or use an appropriate `Cache` class "
+                    "(https://huggingface.co/docs/transformers/kv_cache#legacy-cache-format)"
+                )
+
         if cache_position is None:
             past_seen_tokens = past_key_values.get_seq_length() if past_key_values is not None else 0
             cache_position = torch.arange(
