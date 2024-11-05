@@ -274,7 +274,7 @@ def repeat_kv(hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:
         return hidden_states
     hidden_states = hidden_states[:, :, None, :, :].expand(batch, num_key_value_heads, n_rep, slen, head_dim)
     return hidden_states.reshape(batch, num_key_value_heads * n_rep, slen, head_dim)
-
+    return hidden_states.repeat_interleave(n_rep, dim=1)
 
 class LlamaAttention(nn.Module):
     """Multi-headed attention from 'Attention Is All You Need' paper"""
@@ -362,7 +362,7 @@ class LlamaAttention(nn.Module):
 
         def run_attn(node_id):
             numa.set_membind([node_id])
-            numa.set_affinity(0, list(range(0, 40)))
+            numa.set_affinity(0, list(range(40, 80)))
 
             nonlocal attn_output, key_states, value_states, query_states
             if past_key_value is not None:
@@ -400,7 +400,7 @@ class LlamaAttention(nn.Module):
         # attn_weights = nn.functional.dropout(attn_weights, p=self.attention_dropout, training=self.training)
         # attn_output = torch.matmul(attn_weights, value_states)
         attn_output = torch.zeros((bsz, q_len, self.hidden_size), device=hidden_states.device, dtype=hidden_states.dtype)
-        attn_thread = threading.Thread(target=run_attn, args=(0,))
+        attn_thread = threading.Thread(target=run_attn, args=(3,))
         attn_thread.start()
         attn_thread.join()
 
@@ -623,26 +623,26 @@ class LlamaSdpaAttention(LlamaAttention):
         is_causal = True if causal_mask is None and q_len > 1 else False
         
         def run_attn(node_id, is_causal, causal_mask):
-            attn_start = time.perf_counter_ns()
+            # attn_start = time.perf_counter_ns()
             numa.set_membind([node_id])
             cores_0 = list(range(0, 40))
             cores_1 = list(range(40, 80))
-            numa.set_affinity(0, cores_0)
+            numa.set_affinity(0, cores_1)
             nonlocal key_states, value_states, attn_output
             torch.set_num_threads(40)
 
-            kv_update_start = time.perf_counter_ns()
+            # kv_update_start = time.perf_counter_ns()
             if past_key_value is not None:
                 cache_kwargs = {"sin": sin, "cos": cos, "cache_position": cache_position}
                 key_states_local, value_states_local = past_key_value.update(key_states, value_states, self.layer_idx, cache_kwargs)
-            kv_update_end = time.perf_counter_ns()
-            print(f"kv cache update: {kv_update_end - kv_update_start}ns")
+            # kv_update_end = time.perf_counter_ns()
+            # print(f"kv cache update: {kv_update_end - kv_update_start}ns")
 
-            repeat_start = time.perf_counter_ns()
+            # repeat_start = time.perf_counter_ns()
             key_states_local = repeat_kv(key_states_local, self.num_key_value_groups)
             value_states_local = repeat_kv(value_states_local, self.num_key_value_groups) 
-            repeat_end = time.perf_counter_ns()
-            print(f"repeat: {repeat_end - repeat_start}ns")
+            # repeat_end = time.perf_counter_ns()
+            # print(f"repeat: {repeat_end - repeat_start}ns")
 
             sdpa_start = time.perf_counter_ns()
             attn_output_local = torch.nn.functional.scaled_dot_product_attention(
@@ -653,11 +653,11 @@ class LlamaSdpaAttention(LlamaAttention):
                 dropout_p=self.attention_dropout if self.training else 0.0,
                 is_causal=is_causal,
             )
-            sdpa_end = time.perf_counter_ns()
-            print(f"sdpa: {sdpa_end - sdpa_start}ns")
+            # sdpa_end = time.perf_counter_ns()
+            # print(f"sdpa: {sdpa_end - sdpa_start}ns")
             attn_output = attn_output_local
-            attn_end = time.perf_counter_ns()
-            print(f"attn func: {attn_end - attn_start}ns")
+            # attn_end = time.perf_counter_ns()
+            # print(f"score/context func: {attn_end - attn_start}ns")
 
         attn_output = torch.zeros((bsz, q_len, self.hidden_size), device=hidden_states.device, dtype=hidden_states.dtype)
         if len(past_key_value.key_cache) == self.layer_idx:
@@ -680,12 +680,12 @@ class LlamaSdpaAttention(LlamaAttention):
             )
         else:
             #decode
-            attn_thread = threading.Thread(target=run_attn, args= (0, is_causal, causal_mask))
-            thread_start = time.perf_counter_ns()
+            attn_thread = threading.Thread(target=run_attn, args= (3, is_causal, causal_mask))
+            # thread_start = time.perf_counter_ns()
             attn_thread.start()
             attn_thread.join()
-            thread_end = time.perf_counter_ns()
-            print(f"attn thread: {thread_end - thread_start}ns")
+            # thread_end = time.perf_counter_ns()
+            # print(f"numa thread: {thread_end - thread_start}ns")
 
         cores_0 = list(range(0, 40))
         numa.set_membind([0])
@@ -750,6 +750,7 @@ class LlamaDecoderLayer(nn.Module):
                 Arbitrary kwargs to be ignored, used for FSDP and other methods that injects code
                 into the model
         """
+        # decoder_start = time.perf_counter_ns()
         cores_0 = list(range(0, 40))
         numa.set_affinity(0, cores_0)
         numa.set_membind([0])
@@ -758,6 +759,7 @@ class LlamaDecoderLayer(nn.Module):
         hidden_states = self.input_layernorm(hidden_states)
 
         # Self Attention
+        # attn_start = time.perf_counter_ns()
         hidden_states, self_attn_weights, present_key_value = self.self_attn(
             hidden_states=hidden_states,
             attention_mask=attention_mask,
@@ -769,6 +771,8 @@ class LlamaDecoderLayer(nn.Module):
             position_embeddings=position_embeddings,
             **kwargs,
         )
+        # attn_end = time.perf_counter_ns()
+        # print(f"attn: {attn_end - attn_start}ns")
 
         numa.set_membind([0])
         numa.set_affinity(0, cores_0)
@@ -790,7 +794,8 @@ class LlamaDecoderLayer(nn.Module):
 
         if use_cache:
             outputs += (present_key_value,)
-
+        # decoder_end = time.perf_counter_ns()
+        # print(f"decoder: {decoder_end - decoder_start}ns")
         return outputs
 
 
